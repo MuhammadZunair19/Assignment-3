@@ -251,155 +251,100 @@ def load_nasa_apod_data(**context):
 
 def version_data_with_dvc(**context):
     """
-    Version the CSV file using DVC inside Docker safely.
-    Logs errors instead of failing the DAG.
+    Copies CSV to project directory, tracks it with DVC, and returns the .dvc metadata path.
     """
     ti = context['ti']
     csv_filepath = ti.xcom_pull(task_ids='load_nasa_apod_data')
     
     if not csv_filepath:
-        print("Warning: No CSV file path received from load task. Skipping DVC versioning.")
-        return None
+        raise ValueError("No CSV file path received from load task")
     
-    try:
-        csv_path = Path(csv_filepath)
-        if not csv_path.exists():
-            print(f"Warning: CSV file not found: {csv_filepath}. Skipping DVC versioning.")
-            return None
-        
-        # Project root (mounted volume)
-        project_root = Path('/opt/airflow/project')
-        project_root.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize DVC if not already initialized
-        dvc_dir = project_root / '.dvc'
-        if not dvc_dir.exists():
-            print("Initializing DVC repository...")
-            result = subprocess.run(
-                ['dvc', 'init', '--no-scm'],
-                cwd=str(project_root),
-                capture_output=True,
-                text=True
-            )
-            if result.returncode != 0:
-                if "already initialized" in result.stderr.lower() or "already initialized" in result.stdout.lower():
-                    print("DVC repo already initialized.")
-                else:
-                    print(f"Warning: DVC init failed: {result.stderr}")
-        
-        # Copy CSV to project data directory for DVC
-        project_data_dir = project_root / 'data'
-        project_data_dir.mkdir(parents=True, exist_ok=True)
-        project_csv_path = project_data_dir / csv_path.name
-        shutil.copy2(csv_path, project_csv_path)
-        print(f"Copied CSV to project directory: {project_csv_path}")
-        
-        # Add CSV to DVC
-        csv_relative_path = project_csv_path.relative_to(project_root)
-        print(f"Adding {csv_relative_path} to DVC...")
-        
-        result = subprocess.run(
-            ['dvc', 'add', str(csv_relative_path)],
-            cwd=str(project_root),
-            capture_output=True,
-            text=True
-        )
-        print(f"DVC add output: {result.stdout}")
-        print(f"DVC add error: {result.stderr}")
-        
-        if result.returncode != 0 and "already added" not in result.stderr.lower():
-            print(f"Warning: DVC add may have failed for {csv_relative_path}")
-        
-        dvc_metadata_file = project_root / f"{csv_relative_path}.dvc"
-        if dvc_metadata_file.exists():
-            print(f"DVC metadata file created: {dvc_metadata_file}")
-            return str(dvc_metadata_file)
-        else:
-            print("Warning: DVC metadata file not found after adding file to DVC")
-            return None
-        
-    except Exception as e:
-        print(f"Warning: Unexpected error during DVC versioning: {e}")
-        return None
+    csv_path = Path(csv_filepath)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV file not found: {csv_filepath}")
+
+    project_root = Path('/opt/airflow/project')
+    project_root.mkdir(parents=True, exist_ok=True)
+    project_data_dir = project_root / 'data'
+    project_data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy CSV to project directory for DVC tracking
+    project_csv_path = project_data_dir / csv_path.name
+    shutil.copy2(csv_path, project_csv_path)
+    print(f"Copied CSV to project directory: {project_csv_path}")
+
+    # Initialize DVC if not already
+    dvc_dir = project_root / '.dvc'
+    if not dvc_dir.exists():
+        print("Initializing DVC repository...")
+        subprocess.run(['dvc', 'init', '--no-scm'], cwd=str(project_root), check=False)
+
+    # Add CSV to DVC
+    csv_relative_path = project_csv_path.relative_to(project_root)
+    print(f"Adding {csv_relative_path} to DVC...")
+    subprocess.run(['dvc', 'add', str(csv_relative_path)], cwd=str(project_root), check=True)
+
+    # Return the .dvc metadata file path
+    dvc_metadata_file = project_root / f"{csv_relative_path}.dvc"
+    if not dvc_metadata_file.exists():
+        raise FileNotFoundError("DVC metadata file not found after adding file to DVC")
+    
+    print(f"DVC metadata file created: {dvc_metadata_file}")
+    return str(dvc_metadata_file)
 
 
 def commit_dvc_metadata_to_git(**context):
-    from git import Repo, GitCommandError
-    import os
-
-    # Pull DVC metadata file path from XCom
+    """
+    Commits DVC metadata to a Git repository and pushes to a remote (e.g., GitHub).
+    """
     ti = context['ti']
     dvc_metadata_filepath = ti.xcom_pull(task_ids='version_data_with_dvc')
 
     if not dvc_metadata_filepath:
-        raise ValueError("No DVC metadata file path received from versioning task")
+        print("No DVC metadata file path received. Skipping Git commit.")
+        return None
 
-    try:
-        project_root = Path('/opt/airflow/project')
-        dvc_metadata_path = Path(dvc_metadata_filepath)
+    dvc_metadata_path = Path(dvc_metadata_filepath)
+    project_root = Path('/opt/airflow/project')
 
-        if not dvc_metadata_path.exists():
-            raise FileNotFoundError(f"DVC metadata file not found: {dvc_metadata_filepath}")
+    # Initialize Git repo if not exists
+    if not (project_root / '.git').exists():
+        print("Initializing Git repository...")
+        repo = Repo.init(str(project_root))
+    else:
+        repo = Repo(str(project_root))
 
-        # Initialize Git repo if it doesn't exist
-        git_dir = project_root / '.git'
-        if not git_dir.exists():
-            print("Initializing Git repository...")
-            repo = Repo.init(str(project_root))
+    # Configure Git user
+    repo.config_writer().set_value("user", "name", "MLOps Pipeline").release()
+    repo.config_writer().set_value("user", "email", "mlops@airflow.local").release()
+
+    # Stage DVC file and .gitignore/.dvcignore if they exist
+    files_to_add = [str(dvc_metadata_path.relative_to(project_root))]
+    for f in ['.dvcignore', '.gitignore']:
+        path = project_root / f
+        if path.exists():
+            files_to_add.append(str(path.relative_to(project_root)))
+    repo.index.add(files_to_add)
+
+    # Commit changes
+    if repo.is_dirty() or repo.untracked_files:
+        execution_date = context.get('ds', datetime.now().strftime('%Y-%m-%d'))
+        commit_message = f"Add DVC metadata for NASA APOD data - {execution_date}"
+        commit = repo.index.commit(commit_message)
+        print(f"Committed to Git: {commit.hexsha} - {commit_message}")
+
+        # Push to remote if remote named 'origin' exists
+        if 'origin' in repo.remotes:
+            print("Pushing commit to remote 'origin'...")
+            repo.remotes.origin.push()
+            print("Push successful")
         else:
-            repo = Repo(str(project_root))
-
-        # Configure Git user
-        try:
-            repo.config_writer().set_value("user", "name", "MuhammadZunair19").release()
-            repo.config_writer().set_value("user", "email", "lifedbs20@gmail.com").release()
-        except:
-            pass
-
-        # Stage DVC metadata
-        repo.index.add([str(dvc_metadata_path.relative_to(project_root))])
-
-        # Add .dvcignore and .gitignore if exist
-        for f in ['.dvcignore', '.gitignore']:
-            path = project_root / f
-            if path.exists():
-                repo.index.add([str(path.relative_to(project_root))])
-
-        # Commit changes if there are any
-        if repo.is_dirty() or repo.untracked_files:
-            execution_date = context.get('ds', datetime.now().strftime('%Y-%m-%d'))
-            commit_message = f"Add DVC metadata for NASA APOD data - {execution_date}"
-            commit = repo.index.commit(commit_message)
-            print(f"Committed locally: {commit_message}")
-
-        # Set remote GitHub repo (replace USERNAME/REPO with yours)
-        github_user = os.environ.get("MuhammadZunair19")  # Or Airflow Variable
-        github_pat = os.environ.get("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")        # Or Airflow Variable
-        if not github_user or not github_pat:
-            print("GitHub credentials not set. Skipping push to remote.")
-            return None
-
-        github_repo_url = f"https://{github_user}:{github_pat}@github.com/{github_user}/MLOps-Assignment-3.git"
-
-        # Add remote if not exist
-        if 'origin' not in [r.name for r in repo.remotes]:
-            repo.create_remote('origin', github_repo_url)
-        else:
-            repo.remotes.origin.set_url(github_repo_url)
-
-        # Push to main branch
-        print("Pushing commits to GitHub...")
-        repo.remotes.origin.push('main')
-        print("Push to GitHub successful.")
-
-        return repo.head.commit.hexsha
-
-    except GitCommandError as e:
-        print(f"Git command failed: {str(e)}")
-        raise
-    except Exception as e:
-        print(f"Unexpected error during Git commit/push: {str(e)}")
-        raise
+            print("No remote named 'origin' configured. Skipping push.")
+        
+        return commit.hexsha
+    else:
+        print("No changes to commit. Skipping Git commit.")
+        return repo.head.commit.hexsha if repo.head.is_valid() else None
 
 
 
